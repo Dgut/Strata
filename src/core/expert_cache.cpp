@@ -3,7 +3,9 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <utility>
 #include <cstring>
 
@@ -67,7 +69,94 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
     return true;
 }
 
+std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, int64_t n_expert,
+                                                              const std::vector<uint8_t>& resident,
+                                                              const std::vector<double>& heat,
+                                                              const std::vector<std::pair<int32_t, int32_t>>& prior) {
+    const size_t n = (size_t) (n_layers * n_expert);
+    std::vector<int64_t> prior_rank(n, INT64_MAX);
+    for (size_t r = 0; r < prior.size(); ++r) {
+        const auto [l, e] = prior[r];
+        if (l >= 0 && l < n_layers && e >= 0 && e < n_expert) {
+            int64_t& pr = prior_rank[(size_t) (l * n_expert + e)];
+            if (pr == INT64_MAX) pr = (int64_t) r;
+        }
+    }
+    std::vector<int64_t> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = (int64_t) i;
+    auto res = [&](int64_t i) { return (size_t) i < resident.size() && resident[(size_t) i] != 0; };
+    auto ht = [&](int64_t i) { return (size_t) i < heat.size() ? heat[(size_t) i] : 0.0; };
+    std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+        if (res(a) != res(b)) return res(a);
+        if (ht(a) != ht(b)) return ht(a) > ht(b);
+        if (prior_rank[(size_t) a] != prior_rank[(size_t) b]) return prior_rank[(size_t) a] < prior_rank[(size_t) b];
+        return a < b;
+    });
+    std::vector<std::pair<int32_t, int32_t>> ranked(n);
+    for (size_t r = 0; r < n; ++r)
+        ranked[r] = {(int32_t) (order[r] / n_expert), (int32_t) (order[r] % n_expert)};
+    return ranked;
+}
+
+bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
+                          const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err) {
+    if (n_layers <= 0 || n_expert <= 0 || n_layers > 65535 || n_expert > 65535) {
+        err = "write_expert_profile: the model's layout does not fit the format";
+        return false;
+    }
+    std::vector<int32_t> table((size_t) (n_layers * n_expert), -1);
+    std::vector<uint16_t> pairs;
+    pairs.reserve(ranked.size() * 2);
+    for (size_t r = 0; r < ranked.size(); ++r) {
+        const auto [l, e] = ranked[r];
+        if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) {
+            err = "write_expert_profile: a ranked pair is out of range";
+            return false;
+        }
+        table[(size_t) (l * n_expert + e)] = (int32_t) r;
+        pairs.push_back((uint16_t) l);
+        pairs.push_back((uint16_t) e);
+    }
+    const uint32_t hdr[5] = {1u, (uint32_t) n_layers, (uint32_t) n_expert, (uint32_t) ranked.size(),
+                             (uint32_t) ranked.size()};
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) {
+        err = "write_expert_profile: cannot create " + tmp;
+        return false;
+    }
+    // the format is little-endian (make_profile.py's "<"): so is every machine this engine runs on
+    bool ok = std::fwrite("STRP", 1, 4, f) == 4 && std::fwrite(hdr, 4, 5, f) == 5 &&
+              (pairs.empty() || std::fwrite(pairs.data(), 2, pairs.size(), f) == pairs.size()) &&
+              std::fwrite(table.data(), 4, table.size(), f) == table.size();
+    ok = (std::fclose(f) == 0) && ok;
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, path, ec);   // replaces an existing file (MoveFileEx / rename(2))
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
+        err = "write_expert_profile: cannot write " + path;
+        return false;
+    }
+    return true;
+}
+
 ExpertCache::~ExpertCache() { close(); }
+
+#if defined(STRATA_USE_HIP)
+bool ExpertCache::ensure_blocking_staging(std::size_t bytes, std::string& err) {
+    if (bytes <= blocking_staging_bytes_) return true;
+    void* next = nullptr;
+    const cudaError_t status = cudaHostAlloc(&next, bytes, cudaHostAllocDefault);
+    if (status != cudaSuccess) {
+        err = std::string("ExpertCache: HIP blocking staging allocation: ") + cudaGetErrorString(status);
+        return false;
+    }
+    if (blocking_staging_) (void) cudaFreeHost(blocking_staging_);
+    blocking_staging_ = static_cast<uint8_t*>(next);
+    blocking_staging_bytes_ = bytes;
+    return true;
+}
+#endif
 
 bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
                        std::string& err) {
@@ -125,6 +214,12 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     n_layers_ = n_layers;
     n_expert_ = n_expert;
     blob_ = blob_bytes;
+#if defined(STRATA_USE_HIP)
+    if (!ensure_blocking_staging((std::size_t) blob_, err)) {
+        close();
+        return false;
+    }
+#endif
     next_free_ = 0;
     fills_ = 0;
     admitted_ = 0;
@@ -154,11 +249,29 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     slots_ = (int64_t) slot_bytes.size();
     blob_ = mx;
     off_ = std::move(off);
+#if defined(STRATA_USE_HIP)
+    if (!ensure_blocking_staging((std::size_t) blob_, err)) {
+        close();
+        return false;
+    }
+#endif
+    // #369: each layer's cursor at the bottom of its own range, as open() seeds it - open() above ran on byte-sized
+    // "slots", so its seeds are not slot indices
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
+    for (int64_t l = 0; l < n_layers; ++l) {
+        int64_t lo = 0, hi = 0;
+        layer_slot_range(l, lo, hi);
+        layer_next_[(size_t) l] = (int32_t) lo;
+    }
     return true;
 }
 
 void ExpertCache::close() {
+#if defined(STRATA_USE_HIP)
+    if (blocking_staging_) (void) cudaFreeHost(blocking_staging_);
+    blocking_staging_ = nullptr;
+    blocking_staging_bytes_ = 0;
+#endif
     off_.clear();
     if (base_ != nullptr) {
         cudaFree(base_);
@@ -256,12 +369,49 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         err = "ExpertCache::fill_slot_blocking: the host blob is null";
         return false;
     }
+#if defined(STRATA_USE_HIP)
+    // Bound HIP's pageable-source staging to one expert instead of repeatedly
+    // registering regions of the mmap. The blocking copy completes before reuse.
+    if (!blocking_staging_ || n > blocking_staging_bytes_) {
+        err = "ExpertCache::fill_slot_blocking: HIP staging buffer is too small";
+        return false;
+    }
+    std::memcpy(blocking_staging_, host_blob, n);
+    const cudaError_t e = cudaMemcpy(dst, blocking_staging_, n, cudaMemcpyHostToDevice);
+#else
     const cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
+#endif
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
         return false;
     }
     ++fills_;
+    return true;
+}
+
+bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
+    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    uint8_t* dst = device_slot(slot);
+    if (dst == nullptr || host_blob == nullptr) {
+        err = dst == nullptr ? "ExpertCache::fill_slot_queued: slot outside the arena"
+                             : "ExpertCache::fill_slot_queued: the host blob is null";
+        return false;
+    }
+    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
+    if (e != cudaSuccess) {
+        err = std::string("ExpertCache::fill_slot_queued: ") + cudaGetErrorString(e);
+        return false;
+    }
+    ++fills_;
+    return true;
+}
+
+bool ExpertCache::sync_queued(std::string& err) {
+    const cudaError_t e = cudaStreamSynchronize((cudaStream_t) 0);
+    if (e != cudaSuccess) {
+        err = std::string("ExpertCache::sync_queued: ") + cudaGetErrorString(e);
+        return false;
+    }
     return true;
 }
 

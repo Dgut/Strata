@@ -26,6 +26,7 @@
 // kernel. This is that first step, and the step it unblocks is the one that can be measured.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -53,6 +54,24 @@ inline constexpr int32_t kNotResident = -1;
 /// running rather than by re-deriving what the file claims.
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err);
+
+/// #477 (--expert-profile-save): what the adaptive tier learned, as a profile ranking EVERY (layer, expert) pair -
+/// the experts resident in VRAM now first (where the swaps left the cache), then the rest; within each, by `heat`
+/// (the routing the adaptive tier counted since the start, descending), then by `prior` (the profile the engine
+/// started from: an expert this run never routed keeps its old place), then by index.  A start from it begins
+/// where this one ended; one with more slots adds the hottest of the rest, one with fewer keeps the hottest.
+/// `resident` and `heat`: n_layers x n_expert entries (`heat` may be empty: no counts, the prior decides).
+std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, int64_t n_expert,
+                                                              const std::vector<uint8_t>& resident,
+                                                              const std::vector<double>& heat,
+                                                              const std::vector<std::pair<int32_t, int32_t>>& prior);
+
+/// #477: writes `ranked` in tools/make_profile.py's format, byte for byte: `STRP`, `1, n_layers, n_expert,
+/// n_ranked, n_ranked` (uint32), the pairs (uint16 layer, uint16 expert), then the n_layers x n_expert int32 table
+/// of each pair's rank (-1: not ranked).  Atomically: a `<path>.tmp` beside it, renamed over `path` once complete,
+/// so a reader (the next start) never sees half a file.  False with `err` when it could not be written.
+bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
+                          const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
 
 class ExpertCache {
 public:
@@ -126,6 +145,10 @@ public:
     /// against a `cudaStreamNonBlocking` one.  The first version used the async form and `verify_slot` refused
     /// the whole run with "slot 0 differs from the arena at byte 0" - which is the check doing its job.
     bool fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
+    /// perf-review D-4: `fill_slot_blocking`'s copy on the same (legacy) stream, but queued: many slots are refilled
+    /// with one `sync_queued` at the end instead of a wait per slot. Same ordering against earlier work, same bytes.
+    bool fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
+    bool sync_queued(std::string& err);
 
     /// Reads `slot` back to the host and compares it to `host_blob`, byte for byte.  **THE ONLY THING THAT SAYS
     /// THE CACHE HOLDS THE EXPERT IT CLAIMS TO.**  A slot table that is right about indices and wrong about
@@ -136,6 +159,11 @@ public:
     int64_t fills() const { return fills_; }
 
 private:
+#if defined(STRATA_USE_HIP)
+    bool ensure_blocking_staging(std::size_t bytes, std::string& err);
+    uint8_t* blocking_staging_ = nullptr;
+    std::size_t blocking_staging_bytes_ = 0;
+#endif
     uint8_t* base_ = nullptr;
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;
