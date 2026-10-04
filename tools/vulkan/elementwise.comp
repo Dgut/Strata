@@ -1,0 +1,197 @@
+// tools/vulkan/elementwise.comp - Vulkan port of src/kernels/cuda/elementwise.cu, the layer glue.
+//
+// One shader, mode picked by push constant (the bf16_gemv precedent: the mode is data; only the grid
+// differs, and that is dispatch state).  Workgroups are 32 wide so rms_norm_weighted's warp-per-row
+// shape carries over exactly: lane == threadIdx.x, and the shfl_down tree becomes a shared-memory
+// tree with the SAME add order (docs/VULKAN-PORT.md rule 2).
+//
+// The two contracts that make this kernel more than trivia are both honoured here:
+//   - softplus HAS THE LARGE-x BRANCH (x > 20 returns x), computed in double like ref/gdn.py's numpy;
+//   - silu IS DOUBLE-THEN-CAST, which needs shaderFloat64 - enabled by the host at vkCreateDevice,
+//     probed and printed at start-up.  RDNA2 (the 6850M XT) exposes it.
+//
+// embedding_gather's oracle is bit-exact against a NON-FUSED mul-then-add (`__fmul_rn`/`__fadd_rn` in
+// CUDA, `volatile` on the host).  RADV contracts mul+add into an FMA aggressively and GLSL cannot say
+// "no" to it, so the product is separated from the add by a shared-memory round-trip with a barrier:
+// no backend can fuse across a workgroup barrier.  (Loop trip counts are workgroup-uniform, so every
+// lane reaches every barrier - barriers are not `return`, docs/VULKAN-PORT.md.)
+#version 450
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// file scope: `shared` in nested scope is illegal (docs/VULKAN-PORT.md, kernel 3)
+shared float sred[32];   // rms tree / gather mul-add separator
+
+// push constants must be a BLOCK in Vulkan GLSL - `struct PC {...}; layout(push_constant) uniform PC pc;`
+// compiles nowhere: "non-opaque uniforms outside a block" + "push_constant can only be used with a block".
+layout(push_constant) uniform PC {
+    int mode;        // 0 gdn_gate 1 silu 2 scale 3 to_f16 4 rms_norm_weighted 5 embedding_gather
+    int n;           // elements (rms: cols)
+    int h_v;         // gdn_gate head count
+    int bits;        // gather code width
+    int bias;        // gather code bias
+    int group;       // gather scale-group elems
+    int out_shift;   // gather: output offset in floats (the parity fixture writes behind guard bytes)
+    int flags;       // bit0: rms has w;  bit1: gather has offsets
+    float s;         // scale factor
+    float eps;       // rms epsilon
+} pc;
+
+layout(binding = 0) buffer FA { float v[]; } fa;   // alpha / x (silu, scale, rms: IN PLACE)
+layout(binding = 1) buffer FB { float v[]; } fb;   // dt
+layout(binding = 2) buffer FC { float v[]; } fc;   // ssm_a / w / scales
+layout(binding = 3) buffer FD { float v[]; } fd;   // offsets
+layout(binding = 4) buffer GU { uint v[]; } gu;    // codes, read as words (no `ubyte` in core GLSL)
+layout(binding = 5) buffer OU { uint v[]; } ou;    // f16 pairs: two halves per word
+layout(binding = 6) buffer OF { float v[]; } of_;  // elementwise outputs (gate, gather)
+
+// `f16_from_f32` from include/strata/kernels/f16_bits.hpp, ported verbatim - the host self-tests its
+// own copy at start-up, and the parity contract is bit-exact agreement with this function.
+uint f16_from_f32(float f) {
+    uint x = floatBitsToUint(f);
+    uint sign = (x >> 16) & 0x8000u;
+    uint rawexp = (x >> 23) & 0xFFu;
+    int ex = int(rawexp) - 127 + 15;
+    uint man = x & 0x7FFFFFu;
+    if (rawexp == 0xFFu) return sign | 0x7C00u | ((man != 0u) ? 0x200u : 0u);
+    if (ex >= 31) return sign | 0x7C00u;
+    if (ex <= 0) {
+        if (ex < -10) return sign;
+        man |= 0x800000u;
+        uint sh = uint(14 - ex);
+        uint h = (man >> sh) & 0x3FFu;
+        uint rem = man & ((1u << sh) - 1u);
+        if (rem > (1u << (sh - 1u)) || (rem == (1u << (sh - 1u)) && (h & 1u) != 0u)) ++h;
+        return sign | h;
+    }
+    uint h = sign | (uint(ex) << 10) | (man >> 13);
+    uint rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) ++h;
+    return h;
+}
+
+// exp() on double, built from OPERATORS ONLY: glslang's Vulkan GLSL has double + - * / but NO double
+// built-in functions (exp/log/sqrt) - "no matching overloaded function found" is the whole message, and
+// neither an #extension line nor 450core brings them. Range reduction x = k*ln2 + r, |r| <= ln2/2;
+// Taylor to r^16 (truncation ~1e-17 relative there); 2^k by exact doubling loop (exact in binary FP,
+// and it keeps the helper free of bit-packing built-ins). Worst-case rounding ~4e-15 relative - four
+// orders below what the f32 cast can even show.
+double expd(double x) {
+    const double LN2 = 0.6931471805599453;
+    // floor() is a built-in too, and has no double overload - truncate toward zero, then step down.
+    double q = x / LN2 + 0.5;
+    double k = double(int(q));
+    if (k > q) k -= 1.0;                          // now k = floor(q), operators only
+    double r = x - k * LN2;                       // |r| <= ln2/2 + a rounding hair
+    double e = 0.0;                               // Horner on sum r^i/i!, i = 16..0, c0 folded last
+    e = e * r + (1.0 / 20922789888000.0);         // 1/16!
+    e = e * r + (1.0 / 1307674368000.0);          // 1/15!
+    e = e * r + (1.0 / 87178291200.0);            // 1/14!
+    e = e * r + (1.0 / 6227020800.0);             // 1/13!
+    e = e * r + (1.0 / 479001600.0);              // 1/12!
+    e = e * r + (1.0 / 39916800.0);               // 1/11!
+    e = e * r + (1.0 / 3628800.0);                // 1/10!
+    e = e * r + (1.0 / 362880.0);                 // 1/9!
+    e = e * r + (1.0 / 40320.0);                  // 1/8!
+    e = e * r + (1.0 / 5040.0);                   // 1/7!
+    e = e * r + (1.0 / 720.0);                    // 1/6!
+    e = e * r + (1.0 / 120.0);                    // 1/5!
+    e = e * r + (1.0 / 24.0);                     // 1/4!
+    e = e * r + (1.0 / 6.0);                      // 1/3!
+    e = e * r + (1.0 / 2.0);                      // 1/2!
+    e = e * r + 1.0;                              // c1
+    e = e * r + 1.0;                              // c0
+    for (int i = 0; i < int(k); ++i) e *= 2.0;    // exact scalings by 2^k (binary FP: no rounding here)
+    for (int i = 0; i < -int(k); ++i) e /= 2.0;
+    return e;
+}
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+
+    if (pc.mode == 0) {           // gdn_gate: softplus(alpha+dt) * ssm_a
+        if (tid < uint(pc.n)) {
+            // f32 transcendentals, exactly like the CUDA kernel's log1pf/expf: the reference is double,
+            // but the 1e-6 tolerance was SET by CUDA's f32 passing it. GLSL has no log1p; log(1+exp(x))
+            // in f32 is what CUDA had for x <= 20 (where exp cannot overflow).
+            const float x = fa.v[tid] + fb.v[int(tid) % pc.h_v];
+            const float sp = x > 20.0 ? x : log(1.0 + exp(x));   // THE BRANCH, not cosmetic
+            of_.v[tid] = sp * fc.v[int(tid) % pc.h_v];
+        }
+        return;
+    }
+    if (pc.mode == 1) {           // silu, DOUBLE then cast (ref/gdn.py's numpy is the oracle) - and the
+                                  // ONLY double transcendental this port needs, hence expd() above
+        if (tid < uint(pc.n)) {
+            const double v = double(fa.v[tid]);
+            fa.v[tid] = float(v / (1.0 + expd(-v)));
+        }
+        return;
+    }
+    if (pc.mode == 2) {           // scale, in place: one multiply, exactly `x * s`
+        if (tid < uint(pc.n)) fa.v[tid] = fa.v[tid] * pc.s;
+        return;
+    }
+    if (pc.mode == 3) {           // f32 -> f16 bulk: two halves per word, one thread per word
+        const uint nw = uint(pc.n) / 2u;
+        if (tid < nw) {
+            const uint h0 = f16_from_f32(fa.v[tid * 2u]);
+            const uint h1 = f16_from_f32(fa.v[tid * 2u + 1u]);
+            ou.v[tid] = h0 | (h1 << 16);
+        }
+        return;
+    }
+    if (pc.mode == 4) {           // rms_norm_weighted: one workgroup per row, warp-per-row add order
+        const uint lane = gl_LocalInvocationID.x;
+        const uint row = gl_WorkGroupID.x;
+        const uint cols = uint(pc.n);
+        const uint base = row * cols;
+        float acc = 0.0;
+        for (uint c = lane; c < cols; c += 32u) {
+            const float r = fa.v[base + c];
+            acc += r * r;                      // the same strided sequential sum as the CUDA kernel
+        }
+        sred[lane] = acc;
+        barrier();
+        // the shfl_down(16/8/4/2/1 tree, lane for lane: identical adds, so bit-identical partials
+        for (uint off = 16u; off > 0u; off >>= 1) {
+            if (lane < off) sred[lane] += sred[lane + off];
+            barrier();
+        }
+        // sqrt() on double would hit the same missing-built-in wall as exp(); CUDA's kernel used rsqrtf
+        // in f32 here anyway, and div+sqrt in f32 (<=1 ulp each) sits far inside the 1e-6 tolerance.
+        // LANE 0 READS AND WRITES sred[0] ITSELF: the first version computed inv into a private then had
+        // ALL lanes store `sred[0] = inv`, and lanes 1..31 - whose private inv is still 0 - raced lane 0's
+        // read of sred[0] and its broadcast. The kernel then normalized everything by zero: every output
+        // exactly +/-0, rel-L1 exactly 1.000e+00, no non-finite to complain about. One writer, barrier,
+        // then everyone reads.
+        if (lane == 0u) sred[0] = 1.0 / sqrt(sred[0] / float(cols) + pc.eps);
+        barrier();
+        const float inv = sred[0];
+        for (uint c = lane; c < cols; c += 32u) {
+            const float r = fa.v[base + c];
+            fa.v[base + c] = ((pc.flags & 1) != 0 ? r * fc.v[c] : r) * inv;   // (r*w)*inv, CUDA's order
+        }
+        return;
+    }
+    if (pc.mode == 5) {           // embedding_gather: bit-exact non-fused mul-then-add
+        const uint lane = gl_LocalInvocationID.x;
+        const uint start = gl_WorkGroupID.x * 32u;
+        const uint n = uint(pc.n);
+        const uint cnt = start < n ? min(32u, n - start) : 0u;   // workgroup-uniform: barriers are safe
+        const uint per_byte = 8u / uint(pc.bits);
+        const uint mask = (1u << uint(pc.bits)) - 1u;
+        for (uint k = 0; k < cnt; ++k) {
+            const uint i = start + k;
+            const uint byte_i = i / per_byte;
+            const uint word = gu.v[byte_i >> 2];
+            const uint byte_v = (word >> ((byte_i & 3u) * 8u)) & 0xFFu;      // no `ubyte`: words + shifts
+            const uint code = (byte_v >> ((i % per_byte) * uint(pc.bits))) & mask;
+            const uint sg = i / uint(pc.group);
+            sred[lane] = float(int(code) + pc.bias) * fc.v[sg];               // the product...
+            barrier();                                                        // ...cannot fuse across it
+            of_.v[i + uint(pc.out_shift)] = sred[lane] + ((pc.flags & 2) != 0 ? fd.v[sg] : 0.0);
+        }
+        return;
+    }
+}

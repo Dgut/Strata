@@ -1,0 +1,215 @@
+// tools/vulkan/quantize_act.comp - Vulkan port of src/kernels/cuda/quantize_act.cu, the activation quantizer.
+//
+// One shader, mode picked by push constant (the bf16_gemv precedent). The contracts this port exists to
+// reproduce, each transcribed from the CUDA source rather than recalled:
+//   1. d32 = amax/127.0f in f32, and the quants divide by **d32**, not by the fp16-rounded scale stored next
+//      to them;
+//   2. the division is DOUBLE and the rounding is rint (half-to-even) - shaderFloat64, probed at start-up;
+//   3. Q8_K's `nearest_int` magic number is round-half-to-EVEN on the ROUNDED f32 product - GLSL cannot stop
+//      RADV contracting `iscale * x + magic` into an FMA (the exact bug nvcc caused, and CUDA fixed with
+//      __fmul_rn), so the rounding is implemented floor-first: the mul feeds `floor()`, a libcall nothing
+//      fuses through. Same rule, same ties, no compiler knob needed.
+//
+// BLOCK LAYOUTS are byte-exact ggml (34 B and 292 B blocks), written as uint words with shift packing - no
+// 16-bit-storage extension needed:
+//   - Q8_K blocks are naturally word-aligned (292 % 4 == 0), so one thread owns every word it writes;
+//   - a Q8_0 block is 34 B and adjacent blocks SHARE boundary words, so one thread takes a PAIR of blocks
+//     (68 B = exactly 17 words) and writes the whole pair. Deterministic ownership, no races.
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    int mode;   // 0 quant_q8_0 1 dequant_q8_0 2 quant_q8_K 3 dequant_q8_K 4 f16 enc table 5 f16 dec table
+    int nb;     // blocks (tables: entries)
+} pc;
+
+layout(binding = 0) buffer FX { float v[]; } fx;    // activations (in) / dequant output (mode 1,3)
+layout(binding = 1) buffer BLK { uint v[]; } blk;   // quant blocks, as words - byte-exact ggml layout
+layout(binding = 2) buffer FO { float v[]; } fo;    // decode-table outputs (mode 5)
+
+// f16_from_f32 from include/strata/kernels/f16_bits.hpp, ported verbatim (the same function elementwise.comp
+// carries); the host self-tests its own copy and the GPU table mode compares them.
+uint f16_from_f32(float f) {
+    uint x = floatBitsToUint(f);
+    uint sign = (x >> 16) & 0x8000u;
+    uint rawexp = (x >> 23) & 0xFFu;
+    int ex = int(rawexp) - 127 + 15;
+    uint man = x & 0x7FFFFFu;
+    if (rawexp == 0xFFu) return sign | 0x7C00u | ((man != 0u) ? 0x200u : 0u);
+    if (ex >= 31) return sign | 0x7C00u;                       // finite overflow SATURATES, not NaN
+    if (ex <= 0) {
+        if (ex < -10) return sign;
+        man |= 0x800000u;
+        uint sh = uint(14 - ex);
+        uint h = (man >> sh) & 0x3FFu;
+        uint rem = man & ((1u << sh) - 1u);
+        if (rem > (1u << (sh - 1u)) || (rem == (1u << (sh - 1u)) && (h & 1u) != 0u)) ++h;
+        return sign | h;
+    }
+    uint h = sign | (uint(ex) << 10) | (man >> 13);
+    uint rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) ++h;
+    return h;
+}
+
+// rint() on double: no double built-ins in Vulkan GLSL (docs/VULKAN-PORT.md, kernel 4), and every input here
+// is |q| <= ~127.007, so trunc-toward-zero + exact fractional part + explicit half-to-even covers it. The
+// subtraction `a - fl` is exact (Sterbenz: consecutive floats near each other); ties are decided on paper.
+double rint_d(double q) {
+    const bool neg = q < 0.0;
+    const double a = neg ? -q : q;
+    const double fl = double(int(a));          // int() truncates toward zero; a >= 0, so this is floor(a)
+    const double frac = a - fl;                // exact for a < 2^23
+    double rr;
+    if (frac > 0.5) rr = fl + 1.0;
+    else if (frac < 0.5) rr = fl;
+    else { const int f = int(fl); rr = (f % 2 == 0) ? fl : fl + 1.0; }   // ties to EVEN, both signs
+    return neg ? -rr : rr;
+}
+
+// ggml's `nearest_int` semantics (round-half-to-even on the rounded f32 product), floor-first so no backend
+// can contract the mul into it. Exact for |p| < 2^22, and every p here is |p| <= ~127.008.
+int nearest_even(float p) {
+    const float r = floor(p);
+    const float frac = p - r;                  // exact: |frac| < 1 and r, p within a factor of 2
+    if (frac > 0.5) return int(r) + 1;
+    if (frac < 0.5) return int(r);
+    const int ri = int(r);
+    return (ri % 2 == 0) ? ri : ri + 1;        // ties to even, incl. floor(-x.5) cases: -0.5->0, -1.5->-2
+}
+
+uint blk_byte(uint p) { return (blk.v[p >> 2] >> ((p & 3u) * 8u)) & 0xFFu; }   // byte-exact block read
+
+// File scope: `shared` in nested scope is illegal (docs/VULKAN-PORT.md, kernel 3).
+// Mode 0 stages each thread's pair here as the 17 WORDS it will store - not bytes. The first version staged
+// BYTES (`shared uint sq[128][68]` = 34816 B) and silently exceeded maxComputeSharedMemorySize (32768 on
+// this driver): RADV created the pipeline anyway, validation refused it, and every mode's output came back
+// with scattered sentinel bytes. PACKED staging: 128 lanes x 17 words = 8704 B, one quarter of the budget.
+shared uint sq[128][17];   // [lane][word of its block pair], bytes packed LE
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+
+    if (pc.mode == 0) {           // quantize_q8_0: ONE THREAD PER PAIR of blocks (68 B = 17 words owned)
+        const uint npairs = (uint(pc.nb) + 1u) / 2u;
+        const bool in_range = tid < npairs;
+        // sq is indexed by the LOCAL id - workgroup memory, 128 lanes wide. Indexing it by gl_GlobalInvocationID
+        // reads and writes past the end of every workgroup's allocation from group 2 onward: legal-looking GLSL,
+        // undefined behavior on the card, and the test's first failure looked exactly like a lost store.
+        const uint lid = gl_LocalInvocationID.x;
+        if (in_range) {
+            for (int w = 0; w < 17; ++w) sq[lid][w] = 0u;   // the phantom half of a trailing odd pair stays 0
+            for (int k = 0; k < 2; ++k) {
+                const uint b = tid * 2u + uint(k);
+                if (b >= uint(pc.nb)) continue;
+                const uint xb = b * 32u;
+                float amax = 0.0;
+                for (int i = 0; i < 32; ++i) amax = max(amax, abs(fx.v[xb + uint(i)]));
+                if (amax == 0.0) continue;                  // ggml's zeroed block: d = 0, all q = 0
+                const float d32 = amax / 127.0;             // subtlety 1: the stored scale is fp16 OF THIS
+                const uint dbits = f16_from_f32(d32);
+                // byte p of the pair lives in word p>>2, lane p&3; single writer per lane so OR-in-place is safe
+                for (uint o = 0; o < 2u; ++o) {
+                    const uint p = uint(k) * 34u + o;
+                    sq[lid][p >> 2] |= ((dbits >> (o * 8u)) & 0xFFu) << ((p & 3u) * 8u);
+                }
+                for (uint i = 0; i < 32u; ++i) {
+                    double r = rint_d(double(fx.v[xb + i]) / double(d32));      // subtlety 2: DOUBLE divide
+                    if (r > 127.0) r = 127.0;
+                    if (r < -128.0) r = -128.0;
+                    const uint p = uint(k) * 34u + 2u + i;
+                    sq[lid][p >> 2] |= (uint(int(r)) & 0xFFu) << ((p & 3u) * 8u);   // int -> uint is two's complement
+                }
+            }
+        }
+        barrier();   // one writer per lane's slice above, all reads below - and all 128 lanes reach it
+        if (in_range) {
+            for (int w = 0; w < 17; ++w) blk.v[tid * 17u + uint(w)] = sq[lid][w];   // pair start 68*tid ==
+        }                                                                            // 34*(2*tid): no padding
+        return;
+    }
+    if (pc.mode == 1) {           // dequantize_q8_0: one thread per block, bytes read through words
+        if (tid >= uint(pc.nb)) return;
+        const uint base = tid * 34u;
+        const uint dbits = blk_byte(base) | (blk_byte(base + 1u) << 8);
+        const float d = unpackHalf2x16(dbits).x;           // subtlety 3: the reader multiplies by d16
+        const bool dneg = (dbits & 0x8000u) != 0u;
+        for (int i = 0; i < 32; ++i) {
+            const uint byte_v = blk_byte(base + 2u + uint(i));
+            const int s8 = int(byte_v) - (byte_v > 127u ? 256 : 0);
+            float p = float(s8) * d;
+            // A zero product's SIGN is part of the contract: `q * d16` for a negative q and a +0.0 fp16 scale
+            // must come back as -0.0 (the reference's plain f32 multiply says so), but RADV compiles Vulkan
+            // GLSL with relaxed-fp flags that include no-signed-zeros, and hands back +0. Rebuild the sign from
+            // the operands when the magnitude is zero; nothing else about the product is touched.
+            if (p == 0.0)   // sign(q XOR d), which is also right for q = 0: float(0) is +0, so 0 * -0 = -0
+                p = ((s8 < 0) != dneg) ? uintBitsToFloat(0x80000000u) : 0.0;
+            fo.v[tid * 32u + uint(i)] = p;
+        }
+        return;
+    }
+    if (pc.mode == 2) {           // quantize_q8_K: one thread per block; 292 B is word-aligned, so every
+                                  // word this thread writes belongs to it and nothing else
+        if (tid >= uint(pc.nb)) return;
+        const uint wbase = tid * 73u;
+        const uint xb = tid * 256u;
+        float maxv = 0.0, amax = 0.0;
+        for (int j = 0; j < 256; ++j) {
+            const float xv = fx.v[xb + uint(j)];
+            const float ax = abs(xv);
+            if (ax > amax) { amax = ax; maxv = xv; }       // STRICTLY greater: ties keep the FIRST maximum
+        }
+        if (amax == 0.0) {                                  // d=0, qs=0 AND bsums=0 (the CUDA kernel zeroes
+            for (uint w = 0; w < 73u; ++w) blk.v[wbase + w] = 0u;   // bsums too; the parity reference agrees)
+            return;
+        }
+        // -127, NOT -128: the trap the fixture measures. DOUBLE divide for the same reason as d below - and it
+        // matters twice over: an approximate iscale shifts every product's last bit, which only shows up at
+        // rounding boundaries (rare on random data) and in `d = 1/iscale` (every block).
+        const float iscale = float(-127.0 / double(maxv));
+        uint word = 0u; int gsum = 0; uint bs_word = 0u;
+        for (int j = 0; j < 256; ++j) {
+            const int v0 = nearest_even(iscale * fx.v[xb + uint(j)]);   // floor-first: no FMA through floor()
+            const int v = min(127, v0);                                 // MIN only - the source has no lower clamp
+            const uint byte_v = uint(v) & 0xFFu;
+            word |= byte_v << (uint(j % 4) * 8u);
+            if (j % 4 == 3) { blk.v[wbase + 1u + uint(j / 4)] = word; word = 0u; }   // reset AFTER the store,
+                                                                                     // not every element
+            const int s8 = int(byte_v) - (byte_v > 127u ? 256 : 0);     // bsums sum the STORED i8, CUDA's way
+            gsum += s8;
+            if (j % 16 == 15) {
+                const uint g = uint(j / 16);                              // group 0..15
+                const uint bits = uint(gsum) & 0xFFFFu;                   // (int16_t) sum: low 16 bits, LE
+                bs_word = (g % 2u == 0u) ? bits : bs_word | (bits << 16);
+                if (g % 2u == 1u) { blk.v[wbase + 65u + g / 2u] = bs_word; bs_word = 0u; }   // same lesson
+                gsum = 0;
+            }
+        }
+        // d last, like ggml - and it cannot alias qs words. The division goes through DOUBLE: RADV lowers a
+        // plain f32 `1.0 / x` to the approximate reciprocal under Vulkan GLSL's relaxed default, one ULP off
+        // the reference's IEEE quotient on ~7% of blocks; the fp64 divide is exact for our magnitudes and the
+        // single cast back to f32 lands on the same bits as a correctly-rounded f32 division (checked against
+        // all 2048 block scales of each fixture, not argued).
+        blk.v[wbase] = floatBitsToInt(float(1.0 / double(iscale)));
+        return;
+    }
+    if (pc.mode == 3) {           // dequantize_q8_K: one thread per block
+        if (tid >= uint(pc.nb)) return;
+        const uint wbase = tid * 73u;
+        const float d = intBitsToFloat(int(blk.v[wbase]));   // the overload wants an int, not a uint
+        for (int j = 0; j < 256; ++j) {
+            const uint byte_v = blk_byte(tid * 292u + 4u + uint(j));
+            fo.v[tid * 256u + uint(j)] = float(int(byte_v) - (byte_v > 127u ? 256 : 0)) * d;
+        }
+        return;
+    }
+    if (pc.mode == 4) {           // the shader's OWN f16 encoder, table mode: fx floats -> blk words (low half)
+        if (tid < uint(pc.nb)) blk.v[tid] = f16_from_f32(fx.v[tid]);
+        return;
+    }
+    if (pc.mode == 5) {           // the shader's OWN f16 decoder, table mode: blk low halves -> fo floats
+        if (tid < uint(pc.nb)) fo.v[tid] = unpackHalf2x16(blk.v[tid] & 0xFFFFu).x;
+        return;
+    }
+}

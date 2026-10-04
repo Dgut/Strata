@@ -1,0 +1,73 @@
+// tools/vulkan/bf16_gemv.comp - Vulkan port of src/kernels/cuda/bf16_gemv.cu (P2.S5).
+//
+// Both CUDA shapes in one shader, picked by push constant: warp-per-row (`bf16_gemv_warp_kernel`, the
+// coalesced path the engine uses for n_out >= 64) and workgroup-per-row with a shared tree reduction
+// (`bf16_gemv_split_kernel`).  Neither keeps a scalar add order, so - exactly like the CUDA parity test -
+// correctness is rel-L1 against a DOUBLE reference over the same bf16 bits, not bit-exactness.  The products
+// are exact in fp32 (both sides are bf16-valued), so whatever error shows up is summation order and nothing
+// else.
+//
+// No subgroup ops: RDNA2 has them, but a shared-memory tree over each row's 32 lanes compiles for every
+// Vulkan 1.2 driver and measures the same thing here.  Threads never return before `barrier()`: the parity
+// rule that a barrier needs the whole workgroup means out-of-range rows are PREDICATED, not returned.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XB { uint x[]; } xbuf;   // bf16 activations, 2 per word
+layout(set = 0, binding = 1, std430) readonly buffer WB { uint w[]; } wbuf;   // bf16 weights, row-major, 2 per word
+layout(set = 0, binding = 2, std430) buffer YB { float y[]; } ybuf;
+
+layout(push_constant) uniform PC { uint n_in; uint n_out; uint split; } pc;   // split: 1 = one WORKGROUP per row
+
+shared float partial[256];
+
+// bf16 -> f32 is a shift; see include/strata/kernels/bf16_bits.hpp.  The host self-tests its own copy.
+float bf16_lo(uint word) { return uintBitsToFloat((word & 0xFFFFu) << 16); }
+float bf16_hi(uint word) { return uintBitsToFloat((word >> 16) << 16); }
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint nw = pc.n_in / 2u;                       // words per row; n_in is even at every real shape
+
+    if (pc.split == 1u) {
+        // bf16_gemv_split_kernel: one workgroup per row, all 256 threads stride the row.
+        const uint o = gl_WorkGroupID.x;
+        float acc = 0.0;
+        if (o < pc.n_out) {
+            const uint w0 = o * nw;
+            for (uint q = tid; q < nw; q += 256u) {
+                acc += bf16_lo(xbuf.x[q]) * bf16_lo(wbuf.w[w0 + q]);
+                acc += bf16_hi(xbuf.x[q]) * bf16_hi(wbuf.w[w0 + q]);
+            }
+        }
+        partial[tid] = acc;
+        barrier();
+        for (uint step = 128u; step > 0u; step >>= 1u) {
+            if (tid < step) partial[tid] += partial[tid + step];
+            barrier();
+        }
+        if (tid == 0u && o < pc.n_out) ybuf.y[o] = partial[0];
+    } else {
+        // bf16_gemv_warp_kernel: 8 rows per workgroup, each row's 32 lanes stride it - consecutive lanes
+        // touch consecutive words, which is the coalescing that took gr_read from 262 ms/token to 8.9.
+        const uint lane = tid & 31u;
+        const uint base = tid & ~31u;                   // this row's 32 partials
+        const uint o = gl_WorkGroupID.x * 8u + (tid >> 5);
+        float acc = 0.0;
+        if (o < pc.n_out) {
+            const uint w0 = o * nw;
+            for (uint q = lane; q < nw; q += 32u) {
+                acc += bf16_lo(xbuf.x[q]) * bf16_lo(wbuf.w[w0 + q]);
+                acc += bf16_hi(xbuf.x[q]) * bf16_hi(wbuf.w[w0 + q]);
+            }
+        }
+        partial[tid] = acc;
+        barrier();
+        for (uint step = 16u; step > 0u; step >>= 1u) {
+            if (lane < step) partial[base + lane] += partial[base + lane + step];
+            barrier();
+        }
+        if (lane == 0u && o < pc.n_out) ybuf.y[o] = partial[base];
+    }
+}

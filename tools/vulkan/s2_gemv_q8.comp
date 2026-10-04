@@ -1,0 +1,83 @@
+// tools/vulkan/s2_gemv_q8.comp - Vulkan port of src/kernels/cuda/s2_gemv_q8.cu: the S2 GEMV that consumes
+// Q8_0 ACTIVATIONS.  One workgroup per output row, 32 lanes striding over quads with four accumulators each,
+// then the shared-memory tree - the CUDA launch's shape (threads_per_row = 32) reproduced exactly, so the add
+// order matches and the result is bit-identical to the CUDA kernel (the PARITY tolerance still covers it).
+//
+// The 34-byte Q8_0 block ({fp16 d; int8 qs[32]}) is read as uint words: a block always starts at byte offset
+// 34*b, which is 0 or 2 mod 4, so the fp16 scale never straddles a word.  (docs/VULKAN-PORT.md: byte planes
+// are uint words and shifts - `ubyte` does not exist in core GLSL.)
+#version 450
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer AB { uint aw[]; } abuf;      // Q8_0 blocks, 34 bytes each
+layout(set = 0, binding = 1, std430) readonly buffer CB { uint cw[]; } cbuf;      // S2 codes, one byte per quad
+layout(set = 0, binding = 2, std430) readonly buffer SB { float scales[]; } sbuf; // S2 group scales (fp32)
+layout(set = 0, binding = 3, std430) buffer YB { float y[]; } ybuf;
+
+layout(push_constant) uniform PC { uint n_quads; uint n_out; } pc;
+
+shared float partial[32];   // file scope: GLSL does not allow `shared` in a nested scope (glslang, first run)
+
+float fp16_to_fp32(uint h) {
+    uint f = (h & 0x8000u) << 16;
+    uint e = (h >> 10) & 0x1Fu;
+    uint m = h & 0x3FFu;
+    if (e == 0u) {
+        if (m == 0u) return uintBitsToFloat(f);
+        uint shift = 0u;                       // subnormal: normalize the mantissa
+        while ((m & 0x200u) == 0u) { m <<= 1u; ++shift; }
+        m = (m << 1u) & 0x3FFu;                // drop the new implicit 1
+        return uintBitsToFloat(f | ((127u + 15u - 1u - shift) << 23) | (m << 13));
+    } else if (e == 31u) {
+        return uintBitsToFloat(f | 0x7F800000u | (m << 13));
+    }
+    return uintBitsToFloat(f | ((e + 112u) << 23) | (m << 13));
+}
+
+uint byte_at(uint byte_idx) {
+    return (abuf.aw[byte_idx >> 2u] >> ((byte_idx & 3u) * 8u)) & 0xFFu;   // the Q8_0 buffer's bytes
+}
+
+int int8_at(uint byte_idx) {
+    const uint b = byte_at(byte_idx);
+    return (int(b) << 24) >> 24;               // sign-extend: qs are int8
+}
+
+void main() {
+    const uint o = gl_WorkGroupID.x;           // one workgroup per output row
+    if (o >= pc.n_out) return;                 // o is workgroup-uniform, so an early exit here cannot strand
+                                               // a lane at a barrier (bf16's gotcha is about PER-LANE ranges)
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint tpr = 32u;                      // threads_per_row, as the CUDA kernel is launched
+    const uint n_quads = pc.n_quads;
+    const uint sbase = o * (n_quads >> 4u);    // n_in/64 scales per row; (q*4)>>6 == q>>4
+
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+    for (uint q = tid; q < n_quads; q += tpr) {
+        const uint byte_ = (cbuf.cw[(o * n_quads + q) >> 2u] >> (((o * n_quads + q) & 3u) * 8u)) & 0xFFu;
+        const float d = sbuf.scales[sbase + (q >> 4u)];
+        // the activation quad: four int8 in one 32-element block, so ONE block scale (ablk = q>>3)
+        const uint off = (q >> 3u) * 34u;                          // this block's first byte
+        const uint dbits = (abuf.aw[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFFFu;   // never straddles: off%4 in {0,2}
+        const float dx = fp16_to_fp32(dbits);
+        const uint xoff = off + 2u + (q & 7u) * 4u;               // qs[(q*4) % 32]
+
+        const float w0 = float(int(byte_ & 3u) - 1) * d;
+        const float w1 = float(int((byte_ >> 2u) & 3u) - 1) * d;
+        const float w2 = float(int((byte_ >> 4u) & 3u) - 1) * d;
+        const float w3 = float(int((byte_ >> 6u) & 3u) - 1) * d;
+        a0 += w0 * (float(int8_at(xoff)) * dx);
+        a1 += w1 * (float(int8_at(xoff + 1u)) * dx);
+        a2 += w2 * (float(int8_at(xoff + 2u)) * dx);
+        a3 += w3 * (float(int8_at(xoff + 3u)) * dx);
+    }
+    partial[tid] = (a0 + a1) + (a2 + a3);
+    barrier();
+    for (uint step = tpr / 2u; step > 0u; step >>= 1u) {
+        if (tid < step) partial[tid] += partial[tid + step];
+        barrier();
+    }
+    if (tid == 0u) ybuf.y[o] = partial[0];
+}

@@ -1,0 +1,69 @@
+// tools/vulkan/s2_gemv.comp - Vulkan port of src/kernels/cuda/s2_gemv.cu (P2.S2), vector-load version.
+//
+// Same contract as the CUDA kernel: one invocation per output row, FP32 accumulation inside the row, no shared
+// memory.  The loads are wide (a uvec4 per block of codes, a uvec4 = 8 fp16 per x load) but the ADDS stay in
+// exactly the CUDA scalar loop's order: ascending j, the two adds of a pair back to back.  Only load width
+// changed, so the result stays bit-identical to the scalar reference; s2_gemv_wg.comp is the variant that
+// reorders adds and therefore needs the tolerance.
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XB { uvec4 x[]; } xbuf;         // fp16 activations, 8 per word
+layout(set = 0, binding = 1, std430) readonly buffer CB { uvec4 codes[]; } cbuf;     // S2 code planes, one uvec4 per block
+layout(set = 0, binding = 2, std430) readonly buffer SB { float scales[]; } sbuf;    // widened fp16 group scales
+layout(set = 0, binding = 3, std430) buffer YB { float y[]; } ybuf;
+
+layout(push_constant) uniform PC { uint nb; uint n_out; } pc;
+
+float fp16_to_fp32(uint h) {
+    uint f = (h & 0x8000u) << 16;
+    uint e = (h >> 10) & 0x1Fu;
+    uint m = h & 0x3FFu;
+    if (e == 0u) {
+        if (m == 0u) return uintBitsToFloat(f);
+        uint shift = 0u;                       // subnormal: normalize the mantissa
+        while ((m & 0x200u) == 0u) { m <<= 1u; ++shift; }
+        m = (m << 1u) & 0x3FFu;                // drop the new implicit 1
+        return uintBitsToFloat(f | ((127u + 15u - 1u - shift) << 23) | (m << 13));
+    } else if (e == 31u) {
+        return uintBitsToFloat(f | 0x7F800000u | (m << 13));
+    }
+    return uintBitsToFloat(f | ((e + 112u) << 23) | (m << 13));
+}
+
+// the code byte covering pair p (elements 2p, 2p+1), selected out of the block's four code words without a
+// dynamic component index: the word is p>>3, whose bits are bit 3 and bit 4 of p.
+uint code_byte(uvec4 cws, uint p) {
+    uint lo = (p & 8u) == 0u ? cws.x : cws.y;
+    uint hi = (p & 8u) == 0u ? cws.z : cws.w;
+    uint w = (p & 16u) == 0u ? lo : hi;
+    return (w >> (((p >> 1) & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    const uint o = gl_GlobalInvocationID.x;
+    if (o >= pc.n_out) return;
+
+    const uint nb = pc.nb;
+    const uint c0 = o * nb;                    // code planes in uvec4 units: one per block
+    const uint s0 = o * nb;
+
+    float acc = 0.0;
+    for (uint b = 0; b < nb; ++b) {
+        const float d = sbuf.scales[s0 + b];
+        const uvec4 cws = cbuf.codes[c0 + b];  // ONE load: all 16 code bytes of the block
+        for (uint v = 0u; v < 8u; ++v) {       // one uvec4 = 8 fp16 activations = 4 pairs
+            const uvec4 xwv = xbuf.x[b * 8u + v];
+            const uint words[4] = uint[4](xwv.x, xwv.y, xwv.z, xwv.w);
+            for (uint k = 0u; k < 4u; ++k) {
+                const uint p = v * 4u + k;     // pair index: elements j = 2p, 2p+1 stay ascending
+                const uint byte_ = code_byte(cws, p);
+                const uint sh = (p & 1u) * 4u;
+                acc += float(int((byte_ >> sh) & 3u) - 1) * d * fp16_to_fp32(words[k] & 0xFFFFu);
+                acc += float(int((byte_ >> (sh + 2u)) & 3u) - 1) * d * fp16_to_fp32(words[k] >> 16);
+            }
+        }
+    }
+    ybuf.y[o] = acc;
+}

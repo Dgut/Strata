@@ -1,0 +1,66 @@
+// tools/vulkan/s2_gemv_wg.comp - the workgroup-reduction variant of the S2 GEMV, mirroring the structure of
+// src/kernels/cuda/s2_gemv_fast.cu's non-staged kernel: one workgroup per output row, threads stride over
+// quads with four accumulators each, then a tree reduction in shared memory.
+//
+// This REOPENS THE SUMMATION ORDER (per-lane partials + tree), so unlike s2_gemv.comp it is not bit-identical
+// to the scalar reference and is judged by the parity test's 1e-5 tolerance - exactly how the CUDA fast path
+// is checked.  It exists to be measured: on a 640-row GEMV one thread per row cannot fill RDNA2's memory
+// pipeline, and this is the variant that can.
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer XB { uvec2 x[]; } xbuf;    // fp16 activations: one uvec2 per quad
+layout(set = 0, binding = 1, std430) readonly buffer CB { uint codes[]; } cbuf;  // S2 code planes, byte-addressed by word
+layout(set = 0, binding = 2, std430) readonly buffer SB { float scales[]; } sbuf;
+layout(set = 0, binding = 3, std430) buffer YB { float y[]; } ybuf;
+
+layout(push_constant) uniform PC { uint nb; uint n_out; } pc;
+
+shared float partial[64];
+
+float fp16_to_fp32(uint h) {
+    uint f = (h & 0x8000u) << 16;
+    uint e = (h >> 10) & 0x1Fu;
+    uint m = h & 0x3FFu;
+    if (e == 0u) {
+        if (m == 0u) return uintBitsToFloat(f);
+        uint shift = 0u;
+        while ((m & 0x200u) == 0u) { m <<= 1u; ++shift; }
+        m = (m << 1u) & 0x3FFu;
+        return uintBitsToFloat(f | ((127u + 15u - 1u - shift) << 23) | (m << 13));
+    } else if (e == 31u) {
+        return uintBitsToFloat(f | 0x7F800000u | (m << 13));
+    }
+    return uintBitsToFloat(f | ((e + 112u) << 23) | (m << 13));
+}
+
+void main() {
+    const uint o = gl_WorkGroupID.x;
+    if (o >= pc.n_out) return;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint nb = pc.nb;
+    const uint nq = nb * 16u;                  // quads per row: n_in / 4
+    const uint c0w = o * nb * 4u;              // code words per row: nb blocks x 4 words
+    const uint s0 = o * nb;
+
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+    for (uint q = tid; q < nq; q += 64u) {
+        const uint word = cbuf.codes[c0w + (q >> 2)];
+        const uint byte_ = (word >> ((q & 3u) * 8u)) & 0xFFu;   // ONE load: four codes
+        const float d = sbuf.scales[s0 + (q >> 4)];             // (q*4) >> 6
+        const uvec2 xw = xbuf.x[q];                            // ONE load: the quad's four fp16
+        a0 += float(int((byte_ >> 0u) & 3u) - 1) * d * fp16_to_fp32(xw.x & 0xFFFFu);
+        a1 += float(int((byte_ >> 2u) & 3u) - 1) * d * fp16_to_fp32(xw.x >> 16);
+        a2 += float(int((byte_ >> 4u) & 3u) - 1) * d * fp16_to_fp32(xw.y & 0xFFFFu);
+        a3 += float(int((byte_ >> 6u) & 3u) - 1) * d * fp16_to_fp32(xw.y >> 16);
+    }
+    partial[tid] = (a0 + a1) + (a2 + a3);
+    barrier();
+    for (uint step = 32u; step > 0u; step >>= 1u) {
+        if (tid < step) partial[tid] += partial[tid + step];
+        barrier();
+    }
+    if (tid == 0u) ybuf.y[o] = partial[0];
+}
